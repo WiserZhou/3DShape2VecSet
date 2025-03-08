@@ -171,10 +171,14 @@ class PointEmbed(nn.Module):
     def __init__(self, hidden_dim=48, dim=128):
         super().__init__()
 
+        # Ensure hidden_dim is divisible by 6
+        # 3 coordinates and 2 sin/cos for each dimension, total 6
         assert hidden_dim % 6 == 0
 
         self.embedding_dim = hidden_dim
+        # Create a geometric sequence for the basis
         e = torch.pow(2, torch.arange(self.embedding_dim // 6)).float() * np.pi
+        # Stack the basis vectors for x, y, and z dimensions
         e = torch.stack([
             torch.cat([e, torch.zeros(self.embedding_dim // 6),
                         torch.zeros(self.embedding_dim // 6)]),
@@ -183,27 +187,49 @@ class PointEmbed(nn.Module):
             torch.cat([torch.zeros(self.embedding_dim // 6),
                         torch.zeros(self.embedding_dim // 6), e]),
         ])
+        # Register the basis as a buffer (non-trainable parameter)
         self.register_buffer('basis', e)  # 3 x 16
 
+        # Linear layer to project concatenated embeddings and input to output dimension
         self.mlp = nn.Linear(self.embedding_dim+3, dim)
 
     @staticmethod
     def embed(input, basis):
+        # Compute projections using einsum for efficient matrix multiplication
         projections = torch.einsum(
             'bnd,de->bne', input, basis)
+        # Concatenate sin and cos of projections to form embeddings
         embeddings = torch.cat([projections.sin(), projections.cos()], dim=2)
         return embeddings
     
     def forward(self, input):
-        # input: B x N x 3
+        # input: B x N x 3 (batch size x number of points x 3D coordinates)
+        # Compute embeddings and concatenate with input, then apply MLP
         embed = self.mlp(torch.cat([self.embed(input, self.basis), input], dim=2)) # B x N x C
         return embed
-
+    
 class DiagonalGaussianDistribution(object):
+    """
+    This class represents a diagonal Gaussian distribution.
+    """
+
     def __init__(self, mean, logvar, deterministic=False):
+        """
+        Initialize the distribution with mean, logvar and optional deterministic flag.
+
+        Args:
+            mean (torch.Tensor): The mean of the distribution.
+            logvar (torch.Tensor): The logvariance of the distribution.
+            deterministic (bool, optional): Whether the distribution is deterministic. Defaults to False.
+        """
         self.mean = mean
         self.logvar = logvar
-        self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
+        # Clamp the logvariance to prevent numerical instability
+        # This is a common trick when working with normal distributions
+        # The range [-30, 20] is chosen to prevent the variance from becoming too small or too large
+        # If the variance is too small, the distribution will be too concentrated and will not be able to capture the uncertainty
+        # If the variance is too large, the distribution will be too spread out and will not be able to capture the mean
+        self.logvar = torch.clamp(self.logvar, min=-30.0, max=20.0)
         self.deterministic = deterministic
         self.std = torch.exp(0.5 * self.logvar)
         self.var = torch.exp(self.logvar)
@@ -211,10 +237,25 @@ class DiagonalGaussianDistribution(object):
             self.var = self.std = torch.zeros_like(self.mean).to(device=self.mean.device)
 
     def sample(self):
+        """
+        Sample from the distribution.
+
+        Returns:
+            torch.Tensor: A sample from the distribution.
+        """
         x = self.mean + self.std * torch.randn(self.mean.shape).to(device=self.mean.device)
         return x
 
     def kl(self, other=None):
+        """
+        Compute the KL divergence with another distribution.
+
+        Args:
+            other (DiagonalGaussianDistribution, optional): The other distribution. Defaults to None.
+
+        Returns:
+            torch.Tensor: The KL divergence.
+        """
         if self.deterministic:
             return torch.Tensor([0.])
         else:
@@ -229,6 +270,16 @@ class DiagonalGaussianDistribution(object):
                     dim=[1, 2, 3])
 
     def nll(self, sample, dims=[1,2,3]):
+        """
+        Compute the negative log-likelihood of a sample.
+
+        Args:
+            sample (torch.Tensor): The sample.
+            dims (list, optional): The dimensions to sum over. Defaults to [1,2,3].
+
+        Returns:
+            torch.Tensor: The negative log-likelihood.
+        """
         if self.deterministic:
             return torch.Tensor([0.])
         logtwopi = np.log(2.0 * np.pi)
@@ -237,6 +288,12 @@ class DiagonalGaussianDistribution(object):
             dim=dims)
 
     def mode(self):
+        """
+        Get the mode of the distribution.
+
+        Returns:
+            torch.Tensor: The mode of the distribution.
+        """
         return self.mean
 
 class AutoEncoder(nn.Module):
