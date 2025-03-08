@@ -100,39 +100,70 @@ class FeedForward(nn.Module):
 class Attention(nn.Module):
     def __init__(self, query_dim, context_dim = None, heads = 8, dim_head = 64, drop_path_rate = 0.0):
         super().__init__()
+        # Calculate the inner dimension
         inner_dim = dim_head * heads
+        # Set context dimension to query dimension if not provided
         context_dim = default(context_dim, query_dim)
+        # Calculate the scaling factor for dot product attention
         self.scale = dim_head ** -0.5
+        # Store the number of attention heads
         self.heads = heads
 
+        # Linear projections for query, key-value pairs, and output
         self.to_q = nn.Linear(query_dim, inner_dim, bias = False)
         self.to_kv = nn.Linear(context_dim, inner_dim * 2, bias = False)
         self.to_out = nn.Linear(inner_dim, query_dim)
 
+        # Set up drop path (stochastic depth) if rate > 0, otherwise use identity
         self.drop_path = DropPath(drop_path_rate) if drop_path_rate > 0. else nn.Identity()
 
     def forward(self, x, context = None, mask = None):
+        # Get the number of attention heads
         h = self.heads
 
+        # Project input to query space
         q = self.to_q(x)
+        # Use input as context if not provided
         context = default(context, x)
+        # Project context to key and value spaces
         k, v = self.to_kv(context).chunk(2, dim = -1)
 
+        # Reshape q, k, v for multi-head attention
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h = h), (q, k, v))
 
+        # Compute scaled dot-product attention
         sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
 
+        # Apply mask if provided
         if exists(mask):
+            # Reshape the mask to flatten all dimensions except the batch dimension
             mask = rearrange(mask, 'b ... -> b (...)')
+            
+            # Get the maximum negative value for the similarity tensor's data type
+            # This will be used to mask out attention to padded tokens
             max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h = h)
+            
+            # Repeat the mask for each attention head
+            # 'b j -> (b h) () j' means:
+            #   - 'b' is the batch dimension
+            #   - 'j' is the sequence length
+            #   - '(b h)' combines batch and head dimensions
+            #   - '()' adds a singleton dimension for broadcasting
+            mask = repeat(mask, 'b j -> (b h) () j', h=h)
+            
+            # Apply the mask to the similarity tensor
+            # ~mask inverts the boolean mask
+            # masked_fill_ fills the masked (True) positions with max_neg_value
             sim.masked_fill_(~mask, max_neg_value)
 
         # Compute attention weights and apply them to values
         attn = sim.softmax(dim = -1)
 
+        # Compute output
         out = einsum('b i j, b j d -> b i d', attn, v)
+        # Reshape output
         out = rearrange(out, '(b h) n d -> b n (h d)', h = h)
+        # Apply output projection and drop path
         return self.drop_path(self.to_out(out))
 
 # Point embedding module
